@@ -150,6 +150,29 @@ Abort path is always available:
 
 Do not reorder stages.
 
+## Transition Rules
+
+State transitions are triggered by specific conditions and must be recorded deterministically.
+
+| Transition Type | Trigger Condition | Action | Next State |
+|----------------|-------------------|--------|------------|
+| claim_failed | Claim attempt returned error | Log error, try next candidate | EXECUTING |
+| claim_became_blocked | Issue became blocked after claim | Record blocker, update status | RECOVERING |
+| exec_blocked | Execution hit external blocker | Run block-with-context | RECOVERING |
+| test_failed | Verification command failed | Record failure, determine remediation | RECOVERING |
+| conditional_fallback_activate | Conditional dependency activated | Activate fallback task | EXECUTING |
+| priority_poll | P0 work appeared | Determine preemption | EXECUTING |
+| transient_failure | Temporary failure (network, resource) | Retry with backoff | EXECUTING |
+| priority_preempt | Higher priority work appeared | Defer current, claim P0 | EXECUTING |
+| session_abort | Unrecoverable condition | Write abort handoff, exit | END |
+| decomposition_invalid | Child tasks don't satisfy parent | Rewire dependencies | PLANNING |
+
+Trigger transitions with:
+
+```bash
+bd flow transition --type <type> --issue <id> --reason "<why>"
+```
+
 ## Mandatory Write Policy
 
 For lifecycle transitions, use `bd flow` wrappers:
@@ -175,6 +198,24 @@ Do not use `bd edit`.
 
 Never claim tests/commands ran unless they were executed.
 
+## Discovery Quarantine Tiers
+
+When discovering new work during execution, classify into tiers:
+
+| Tier | Scope | Time | Action |
+|------|-------|------|--------|
+| T1 | Trivial, no new files | <5 min | Inline fix, no tracking |
+| T2 | Small, 1-2 files | <15 min | Inline with note in issue |
+| T3 | Medium, needs tracking | <60 min | Create task with discovered-from link |
+| T4 | Large, multi-session | >60 min | Create epic, defer to planning |
+
+**Boundary Rules:**
+- If unsure between T2/T3: choose T3 (track it)
+- T3+ requires `bd flow create-discovered --from <origin-id> --title "..."`
+- T4 stops current execution, records state, escalates to planning
+
+**Rationale:** Unconstrained discovery causes scope creep and context loss. Tier boundaries force explicit decisions about inline vs. tracked work.
+
 ## Intake Hard Gate
 
 If plan items are 2+ or decomposition creates 4+ tasks:
@@ -196,6 +237,41 @@ Run deterministic recovery before declaring idle:
 bd recover loop --parent <epic-id> --module-label module/<name> --json
 bd recover signature --parent <epic-id> --iteration <n> --elapsed-minutes <m> --json
 ```
+
+### Recovery Loop Phases
+
+When `bd ready` returns empty, run `bd recover loop` which executes:
+
+**Phase 1: Quick Diagnosis**
+- Check preflight gate status
+- Query scoped ready set
+- Result: Either find work or proceed to Phase 2
+
+**Phase 2: Structural Diagnosis**
+- Check for dependency cycles: `bd dep cycles`
+- Find stale WIP (in_progress >24h): `bd stale --days 1`
+- Review dep trees for blocked chains: `bd dep tree <id> --direction up`
+- Result: Identify structural blockers or proceed to Phase 3
+
+**Phase 3: Limbo Detection**
+- Find invisible blockers (unlinked dependencies)
+- Check external dependencies (waiting on PR, review, response)
+- Detect deferred work without resurface date
+- Result: Identify limbo state or proceed to Phase 4
+
+**Phase 4: Widen Scope**
+- Remove parent/label filters
+- Query full ready set
+- Check other modules/epics for work
+- Result: Find work or proceed to Phase 5
+
+**Phase 5: Convergence/Escalation**
+- Calculate convergence signature: iteration count + elapsed time
+- If cycles < 3 AND elapsed < 30min: continue loop
+- If cycles >= 3 OR elapsed >= 30min: escalate with decision request
+- Result: Escalation with full context
+
+**Convergence Signature**: `bd recover signature --parent <id> --iteration <n> --elapsed-minutes <m>`
 
 Interpret results:
 - `recover_ready_found` or `recover_ready_found_widened`: return to execute loop
@@ -235,6 +311,61 @@ Use:
 ```bash
 bd reason lint --reason "<close reason>"
 ```
+
+### Trigger Keywords List
+
+The following 11 keywords are treated as failure triggers by `bd` and are used to evaluate conditional-blocks dependencies (where task B runs only if task A fails):
+
+- `failed`
+- `rejected`
+- `wontfix`
+- `won't fix`
+- `canceled`
+- `cancelled`
+- `abandoned`
+- `blocked`
+- `error`
+- `timeout`
+- `aborted`
+
+These keywords must NOT appear in success close reasons. Including them corrupts conditional-blocks dependency evaluation, causing false failure detection.
+
+### Success Close Verbs
+
+When closing tasks successfully, use these verbs (and similar action verbs) to describe completion:
+
+- `added` - New feature, code, or configuration added
+- `implemented` - Feature or behavior implemented
+- `refactored` - Code restructured without behavior change
+- `updated` - Existing code or configuration modified
+- `removed` - Code or configuration deleted
+- `migrated` - Data or code moved between systems
+- `configured` - Settings or infrastructure configured
+- `extracted` - Code pulled out into module/function
+- `replaced` - Old implementation swapped for new
+- `consolidated` - Multiple elements combined into one
+
+### Safe vs Unsafe Examples
+
+**SAFE (success close reasons):**
+
+- `implemented: added auth check to login endpoint`
+- `refactored: extracted validation into separate module`
+- `added: new user registration flow`
+- `configured: CI pipeline with test automation`
+- `removed: deprecated authentication middleware`
+
+**UNSAFE (contains trigger keywords):**
+
+- `failed: tests passed` - Contains `failed`
+- `error: completed successfully` - Contains `error`
+- `blocked: resolved all blockers` - Contains `blocked`
+- `aborted: successfully aborted transaction` - Contains `aborted` (ambiguous)
+- `rejected: PR accepted after review` - Contains `rejected`
+
+### Rationale
+
+Conditional-blocks dependencies (`bd dep add <blocked> <blocker> --type conditional-blocks`) enable "run B only if A fails" workflows. This is implemented by close-reason keyword matching. If a success reason contains a failure keyword, `bd` incorrectly interprets the task as failed, triggering downstream conditional tasks incorrectly. Always use `bd reason lint` before closing.
 
 ## Auditability Protocol
 
@@ -288,6 +419,54 @@ For blocked/deferred work, include context pack order:
 - Keep one active WIP per actor unless preempted by explicit policy.
 - Preserve invariants: external contracts, data integrity, security boundaries.
 - Internal refactors may break internal interfaces if invariants are preserved.
+
+## Strict Control Mode
+
+### BD_STRICT_CONTROL
+
+Environment variable for enabling strict control-plane enforcement:
+
+```bash
+export BD_STRICT_CONTROL=1
+```
+
+**When enabled, the following additional checks apply:**
+
+1. **Anchor Requirement**: `flow claim-next` requires `--require-anchor` and `--parent` by default
+2. **Explicit ID Resolution**: Partial IDs must match exactly, no fuzzy matching
+3. **Gate Enforcement**: Preflight gates are mandatory, not advisory
+
+**CLI Override:**
+- `--strict-control`: Enable strict mode per-command
+- `--allow-missing-anchor`: Bypass anchor requirement when explicitly justified
+
+**Rationale:** Strict mode prevents common agent errors in automated workflows where context may be incomplete.
+
+## Standing Policies
+
+These policies are always in effect:
+
+1. **WIP Policy**: One in_progress issue per actor unless explicitly preempted. Rationale: Focus reduces context switching overhead.
+
+2. **Parallel Rule**: Independent tasks may be claimed by different actors. Rationale: Throughput optimization for non-conflicting work.
+
+3. **Stickiness + Anchors**: Tasks remain in module scope via anchor labels. Rationale: Context coherence within bounded areas.
+
+4. **Defer Policy**: Deferred issues MUST have `--until` date. Rationale: Deferred without until = hidden forever.
+
+5. **External-Blocker Caveat**: External blockers need context pack with expected resolution. Rationale: External deps are invisible without explicit tracking.
+
+6. **Context Pack Format**: `state; repro; next; files; blockers`. Rationale: Canonical order enables quick context recovery.
+
+7. **Parent-Close Check**: Cannot close parent with open children. Rationale: Incomplete decomposition = incomplete outcome.
+
+8. **Context Freshness**: Context pack must be updated when state changes. Rationale: Stale context = wrong decisions.
+
+9. **Living State Digest**: Anchor issues include state digest in notes. Rationale: Quick resume without full history scan.
+
+10. **Multi-Agent Overlap**: Explicit coordination required when work intersects. Rationale: Race conditions corrupt state.
+
+11. **Commit Granularity**: One logical change per commit, linked to issue ID. Rationale: Atomic commits enable atomic rollbacks.
 
 ## Canonical References
 

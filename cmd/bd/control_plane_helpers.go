@@ -127,6 +127,68 @@ func lintCloseReason(reason string, allowFailureReason bool) error {
 	return nil
 }
 
+// validateAtomicTaskStandard checks if an issue meets atomic task standards
+func validateAtomicTaskStandard(issue *types.Issue) []string {
+	violations := []string{}
+
+	if issue == nil {
+		return violations
+	}
+
+	// Title format check
+	title := strings.TrimSpace(issue.Title)
+	if len(title) < 10 {
+		violations = append(violations, "title_too_short: title should be at least 10 characters")
+	}
+	if len(title) > 80 {
+		violations = append(violations, "title_too_long: title should be at most 80 characters")
+	}
+
+	// Check title starts with verb
+	verbs := []string{"add", "fix", "update", "remove", "refactor", "implement", "create", "delete", "migrate", "configure", "extract", "replace", "consolidate"}
+	words := strings.Fields(title)
+	if len(words) > 0 {
+		firstWord := strings.ToLower(words[0])
+		isVerb := false
+		for _, v := range verbs {
+			if firstWord == v {
+				isVerb = true
+				break
+			}
+		}
+		if !isVerb {
+			violations = append(violations, "title_not_verb: title should start with action verb (add, fix, update, etc.)")
+		}
+	}
+
+	// Description structure check
+	desc := issue.Description
+	requiredSections := []string{"## Context", "## Change", "## Acceptance Criteria", "## Verify"}
+	for _, section := range requiredSections {
+		if !strings.Contains(desc, section) {
+			violations = append(violations, fmt.Sprintf("missing_section: %s", section))
+		}
+	}
+
+	return violations
+}
+
+func validateEvidenceTuple(evidence string, nonHermetic bool) error {
+	if !nonHermetic {
+		return nil // Only validate for non-hermetic checks
+	}
+	// Evidence tuple must contain ts:, env:, artifact:
+	lower := strings.ToLower(evidence)
+	hasTS := strings.Contains(lower, "ts:")
+	hasEnv := strings.Contains(lower, "env:")
+	hasArtifact := strings.Contains(lower, "artifact:")
+
+	if !hasTS || !hasEnv || !hasArtifact {
+		return fmt.Errorf("non-hermetic evidence requires tuple with ts:, env:, artifact: fields, got: %s", evidence)
+	}
+	return nil
+}
+
 func strictControlExplicitIDsEnabled(flag bool) bool {
 	if flag {
 		return true

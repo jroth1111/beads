@@ -2186,6 +2186,20 @@ var flowCloseSafeCmd = &cobra.Command{
 			}, exitCodePolicyViolation)
 			return
 		}
+		if flowCloseNonHermetic {
+			for _, entry := range verificationEntries {
+				if err := validateEvidenceTuple(entry, true); err != nil {
+					finishEnvelope(commandEnvelope{
+						OK:      false,
+						Command: "flow close-safe",
+						Result:  "policy_violation",
+						Details: map[string]interface{}{"message": err.Error()},
+						Events:  []string{"close_skipped"},
+					}, exitCodePolicyViolation)
+					return
+				}
+			}
+		}
 		requireEvidenceTuple := evidenceRequirementForVerificationFlow(flowCloseNonHermetic, flowCloseRequireEvidence)
 		evidenceMaxAge := 24 * time.Hour
 		if requireEvidenceTuple {
@@ -2605,6 +2619,9 @@ func collectPreclaimViolations(issue *types.Issue, deps []*types.IssueWithDepend
 			violations = append(violations, "estimate_or_split.missing")
 		}
 	}
+	// Add atomic task standard validation
+	atomicViolations := validateAtomicTaskStandard(issue)
+	violations = append(violations, atomicViolations...)
 	return violations
 }
 
@@ -3448,7 +3465,7 @@ func init() {
 
 	flowCloseSafeCmd.Flags().StringVar(&flowCloseIssueID, "issue", "", "Issue ID to close")
 	flowCloseSafeCmd.Flags().StringVar(&flowCloseReason, "reason", "", "Close reason")
-	flowCloseSafeCmd.Flags().StringArrayVar(&flowCloseVerificationEntries, "verified", nil, "Verification evidence entry (repeat flag)")
+	flowCloseSafeCmd.Flags().StringArrayVar(&flowCloseVerificationEntries, "verified", nil, "Verification evidence entry (repeat flag). For --non-hermetic flows, must include ts:, env:, artifact: fields")
 	flowCloseSafeCmd.Flags().StringArrayVar(&flowCloseNotes, "note", nil, "Additional close notes (repeat flag)")
 	flowCloseSafeCmd.Flags().BoolVarP(&flowCloseForce, "force", "f", false, "Force close pinned/issues with open blockers (requires force-close audit fields)")
 	flowCloseSafeCmd.Flags().BoolVar(&flowCloseAllowFailureReason, "allow-failure-reason", false, "Allow failed: close reasons")
@@ -3458,7 +3475,7 @@ func init() {
 	flowCloseSafeCmd.Flags().BoolVar(&flowCloseRequireParentCheck, "require-parent-cascade", false, "Require parent-close cascade check (no open parent-child dependents)")
 	flowCloseSafeCmd.Flags().BoolVar(&flowCloseAllowOpenChildren, "allow-open-children", false, "Bypass strict-control default parent-cascade enforcement")
 	flowCloseSafeCmd.Flags().BoolVar(&flowCloseRequireEvidence, "require-evidence-tuple", false, "Require a fresh EvidenceTuple note entry before close")
-	flowCloseSafeCmd.Flags().BoolVar(&flowCloseNonHermetic, "non-hermetic", false, "Mark verification flow as non-hermetic and require EvidenceTuple automatically")
+	flowCloseSafeCmd.Flags().BoolVar(&flowCloseNonHermetic, "non-hermetic", false, "Mark verification flow as non-hermetic. Requires --verified entries to include ts:, env:, artifact: fields and enables EvidenceTuple validation")
 	flowCloseSafeCmd.Flags().StringVar(&flowCloseEvidenceMaxAge, "evidence-max-age", "24h", "Maximum allowed EvidenceTuple age when --require-evidence-tuple is set")
 	flowCloseSafeCmd.Flags().BoolVar(&flowCloseRequirePriorityPoll, "require-priority-poll", false, "Require a fresh Priority poll note before close")
 	flowCloseSafeCmd.Flags().StringVar(&flowClosePriorityPollMaxAge, "priority-poll-max-age", "30m", "Maximum age for Priority poll note when --require-priority-poll is set")
