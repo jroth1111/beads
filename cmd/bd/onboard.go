@@ -28,7 +28,7 @@ Run ` + "`bd prime`" + ` for workflow context, or install hooks (` + "`bd hooks 
 - ` + "`bd ready`" + ` - Find unblocked work
 - ` + "`bd create \"Title\" --type task --priority 2`" + ` - Create issue
 - ` + "`bd close <id>`" + ` - Complete work
-- ` + "`bd sync`" + ` - Sync with git (run at session end)
+- ` + "`bd dolt push`" + ` - Push beads to remote
 
 For full workflow details: ` + "`bd prime`" + ``
 
@@ -41,7 +41,7 @@ Run ` + "`bd prime`" + ` for workflow context, or install hooks (` + "`bd hooks 
 - ` + "`bd ready`" + ` - Find unblocked work
 - ` + "`bd create \"Title\" --type task --priority 2`" + ` - Create issue
 - ` + "`bd close <id>`" + ` - Complete work
-- ` + "`bd sync`" + ` - Sync with git (run at session end)
+- ` + "`bd dolt push`" + ` - Push beads to remote
 
 For full workflow details: ` + "`bd prime`" + ``
 

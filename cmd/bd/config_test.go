@@ -210,7 +210,7 @@ func setupTestDB(t *testing.T) (*dolt.DoltStore, func()) {
 	store, err := dolt.New(context.Background(), &dolt.Config{Path: testDB})
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 
 	// CRITICAL (bd-166): Set issue_prefix to prevent "database not initialized" errors
@@ -326,8 +326,9 @@ func TestValidateSyncConfig(t *testing.T) {
 		}
 
 		issues := validateSyncConfig(tmpDir)
-		if len(issues) != 0 {
-			t.Errorf("Expected no issues for valid empty config, got: %v", issues)
+		// After JSONL removal, Dolt sync requires federation.remote
+		if len(issues) != 1 {
+			t.Errorf("Expected 1 issue (missing federation.remote) for empty config, got: %v", issues)
 		}
 	})
 
@@ -397,10 +398,10 @@ federation:
 		}
 	})
 
-	t.Run("external mode without remote", func(t *testing.T) {
+	t.Run("dolt-native mode without remote", func(t *testing.T) {
 		configContent := `prefix: test
 sync:
-  mode: "external"
+  mode: "dolt-native"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 			t.Fatalf("Failed to write config.yaml: %v", err)
@@ -444,11 +445,11 @@ federation:
 	t.Run("valid sync config", func(t *testing.T) {
 		configContent := `prefix: test
 sync:
-  mode: "git-branch"
+  mode: "dolt-native"
 conflict:
-  strategy: "lww"
+  strategy: "newest"
 federation:
-  sovereignty: "federated"
+  sovereignty: "T2"
   remote: "https://github.com/user/beads-data.git"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {

@@ -42,15 +42,10 @@ func FindDatabasePath() string {
 	return beads.FindDatabasePath()
 }
 
-// FindBeadsDir finds the .beads/ directory in the current directory tree
-// Returns empty string if not found. Supports both database and JSONL-only mode.
+// FindBeadsDir finds the .beads/ directory in the current directory tree.
+// Returns empty string if not found.
 func FindBeadsDir() string {
 	return beads.FindBeadsDir()
-}
-
-// FindJSONLPath finds the JSONL file corresponding to a database path
-func FindJSONLPath(dbPath string) string {
-	return beads.FindJSONLPath(dbPath)
 }
 
 // DatabaseInfo contains information about a beads database
@@ -72,25 +67,25 @@ func GetRedirectInfo() RedirectInfo {
 
 // Core types from internal/types
 type (
-	Issue            = types.Issue
-	Status           = types.Status
-	IssueType        = types.IssueType
-	Dependency       = types.Dependency
-	DependencyType   = types.DependencyType
-	Label            = types.Label
-	Comment          = types.Comment
-	Event            = types.Event
-	EventType        = types.EventType
-	BlockedIssue     = types.BlockedIssue
-	TreeNode         = types.TreeNode
-	IssueFilter      = types.IssueFilter
-	WorkFilter       = types.WorkFilter
-	StaleFilter      = types.StaleFilter
-	DependencyCounts = types.DependencyCounts
-	IssueWithCounts              = types.IssueWithCounts
-	IssueWithDependencyMetadata  = types.IssueWithDependencyMetadata
-	SortPolicy                   = types.SortPolicy
-	EpicStatus                   = types.EpicStatus
+	Issue                       = types.Issue
+	Status                      = types.Status
+	IssueType                   = types.IssueType
+	Dependency                  = types.Dependency
+	DependencyType              = types.DependencyType
+	Label                       = types.Label
+	Comment                     = types.Comment
+	Event                       = types.Event
+	EventType                   = types.EventType
+	BlockedIssue                = types.BlockedIssue
+	TreeNode                    = types.TreeNode
+	IssueFilter                 = types.IssueFilter
+	WorkFilter                  = types.WorkFilter
+	StaleFilter                 = types.StaleFilter
+	DependencyCounts            = types.DependencyCounts
+	IssueWithCounts             = types.IssueWithCounts
+	IssueWithDependencyMetadata = types.IssueWithDependencyMetadata
+	SortPolicy                  = types.SortPolicy
+	EpicStatus                  = types.EpicStatus
 )
 
 // Status constants

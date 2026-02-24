@@ -1,22 +1,24 @@
-//go:build cgo
-
 package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
-	dolt "github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -26,22 +28,26 @@ var doltCmd = &cobra.Command{
 	Short:   "Configure Dolt database settings",
 	Long: `Configure and manage Dolt database settings and server lifecycle.
 
-Dolt can run in two modes:
-  - embedded: In-process database (default, single-process only)
-  - server:   Connect to external dolt sql-server (multi-process, high-concurrency)
+Beads uses a dolt sql-server for all database operations. The server is
+auto-started transparently when needed. Use these commands for explicit
+control or diagnostics.
 
-Commands:
+Server lifecycle:
+  bd dolt start        Start the Dolt server for this project
+  bd dolt stop         Stop the Dolt server for this project
+  bd dolt status       Show Dolt server status
+
+Configuration:
   bd dolt show         Show current Dolt configuration with connection test
   bd dolt set <k> <v>  Set a configuration value
   bd dolt test         Test server connection
-  bd dolt start        Start a Dolt SQL server (background process)
-  bd dolt stop         Stop the running Dolt SQL server
+
+Version control:
   bd dolt commit       Commit pending changes
   bd dolt push         Push commits to Dolt remote
   bd dolt pull         Pull commits from Dolt remote
 
 Configuration keys for 'bd dolt set':
-  mode      Connection mode: "embedded" or "server"
   database  Database name (default: issue prefix or "beads")
   host      Server host (default: 127.0.0.1)
   port      Server port (default: 3307)
@@ -51,9 +57,6 @@ Flags for 'bd dolt set':
   --update-config  Also write to config.yaml for team-wide defaults
 
 Examples:
-  bd dolt start                              Start server with configured settings
-  bd dolt stop                               Stop the running server
-  bd dolt set mode server
   bd dolt set database myproject
   bd dolt set host 192.168.1.100 --update-config
   bd dolt test`,
@@ -73,8 +76,7 @@ var doltSetCmd = &cobra.Command{
 	Long: `Set a Dolt configuration value in metadata.json.
 
 Keys:
-  mode      Connection mode: "embedded" or "server"
-  database  Database name for server mode
+  database  Database name (default: issue prefix or "beads")
   host      Server host (default: 127.0.0.1)
   port      Server port (default: 3307)
   user      MySQL user (default: root)
@@ -82,7 +84,6 @@ Keys:
 Use --update-config to also write to config.yaml for team-wide defaults.
 
 Examples:
-  bd dolt set mode server
   bd dolt set database myproject
   bd dolt set host 192.168.1.100
   bd dolt set port 3307 --update-config`,
@@ -107,35 +108,6 @@ This verifies that:
 Use this before switching to server mode to ensure the server is running.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		testDoltConnection()
-	},
-}
-
-var doltStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start a Dolt SQL server using configured settings",
-	Long: `Start a Dolt SQL server as a background process.
-
-Uses the host, port, and user from your Dolt configuration (see 'bd dolt show').
-The server runs in the background and persists after bd exits.
-
-Configuration sources (priority order):
-  1. Environment variables (BEADS_DOLT_*)
-  2. metadata.json (bd dolt set)
-  3. config.yaml (team defaults)`,
-	Run: func(cmd *cobra.Command, args []string) {
-		startDoltServer()
-	},
-}
-
-var doltStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the running Dolt SQL server",
-	Long: `Stop the Dolt SQL server started by 'bd dolt start'.
-
-Sends a graceful shutdown signal (SIGTERM). If the server doesn't stop
-within 10 seconds, it is forcefully terminated.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		stopDoltServer()
 	},
 }
 
@@ -203,9 +175,12 @@ var doltCommitCmd = &cobra.Command{
 	Short: "Create a Dolt commit from pending changes",
 	Long: `Create a Dolt commit from any uncommitted changes in the working set.
 
-This is useful before push operations that require a clean working set.
-Normally, auto-commit handles this after each bd write command, but manual
-commit may be needed if auto-commit was off or changes were made externally.
+This is the primary commit point for batch mode. When auto-commit is set to
+"batch", changes accumulate in the working set across multiple bd commands and
+are committed together here with a descriptive summary message.
+
+Also useful before push operations that require a clean working set, or when
+auto-commit was off or changes were made externally.
 
 For more options (--stdin, custom messages), see: bd vc commit`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -217,33 +192,384 @@ For more options (--stdin, custom messages), see: bd vc commit`,
 		}
 		msg, _ := cmd.Flags().GetString("message")
 		if msg == "" {
-			msg = "bd: manual commit (dolt commit)"
-		}
-		if err := st.Commit(ctx, msg); err != nil {
-			errLower := strings.ToLower(err.Error())
-			if strings.Contains(errLower, "nothing to commit") || strings.Contains(errLower, "no changes") {
+			// No explicit message — use CommitPending which generates a
+			// descriptive summary of accumulated changes.
+			committed, err := st.CommitPending(ctx, getActor())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if !committed {
 				fmt.Println("Nothing to commit.")
+				return
+			}
+		} else {
+			if err := st.Commit(ctx, msg); err != nil {
+				errLower := strings.ToLower(err.Error())
+				if strings.Contains(errLower, "nothing to commit") || strings.Contains(errLower, "no changes") {
+					fmt.Println("Nothing to commit.")
+					return
+				}
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		commandDidExplicitDoltCommit = true
+		fmt.Println("Committed.")
+	},
+}
+
+var doltStartCmd = &cobra.Command{
+	Use:   "start",
+	Short: "Start the Dolt SQL server for this project",
+	Long: `Start a dolt sql-server for the current beads project.
+
+The server runs in the background on a per-project port derived from the
+project path. PID and logs are stored in .beads/.
+
+The server auto-starts transparently when needed, so manual start is rarely
+required. Use this command for explicit control or diagnostics.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
+			os.Exit(1)
+		}
+		serverDir := doltserver.ResolveServerDir(beadsDir)
+
+		if doltserver.IsDaemonManaged() {
+			// Check if daemon's server is already accepting connections
+			cfg := doltserver.DefaultConfig(serverDir)
+			addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				fmt.Printf("Dolt server already running on port %d (managed by Gas Town daemon)\n", cfg.Port)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Warning: Dolt server is normally managed by the Gas Town daemon,\n"+
+				"but no server found on port %d. Starting one.\n\n", cfg.Port)
+		}
+
+		state, err := doltserver.Start(serverDir)
+		if err != nil {
+			if strings.Contains(err.Error(), "already running") {
+				fmt.Println(err)
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("Committed.")
+
+		fmt.Printf("Dolt server started (PID %d, port %d)\n", state.PID, state.Port)
+		fmt.Printf("  Data: %s\n", state.DataDir)
+		fmt.Printf("  Logs: %s\n", doltserver.LogPath(serverDir))
 	},
+}
+
+var doltStopCmd = &cobra.Command{
+	Use:   "stop",
+	Short: "Stop the Dolt SQL server for this project",
+	Long: `Stop the dolt sql-server managed by beads for the current project.
+
+This sends a graceful shutdown signal. The server will restart automatically
+on the next bd command unless auto-start is disabled.
+
+Under Gas Town, the server is managed by the gt daemon and cannot be stopped
+via bd. Use 'gt dolt stop' instead.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
+			os.Exit(1)
+		}
+		serverDir := doltserver.ResolveServerDir(beadsDir)
+		force, _ := cmd.Flags().GetBool("force")
+
+		if err := doltserver.StopWithForce(serverDir, force); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Dolt server stopped.")
+	},
+}
+
+var doltStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show Dolt server status",
+	Long: `Show the status of the dolt sql-server for the current project.
+
+Displays whether the server is running, its PID, port, and data directory.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
+			os.Exit(1)
+		}
+		serverDir := doltserver.ResolveServerDir(beadsDir)
+
+		state, err := doltserver.IsRunning(serverDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			outputJSON(state)
+			return
+		}
+
+		if state == nil || !state.Running {
+			cfg := doltserver.DefaultConfig(serverDir)
+			fmt.Println("Dolt server: not running")
+			fmt.Printf("  Expected port: %d\n", cfg.Port)
+			return
+		}
+
+		fmt.Println("Dolt server: running")
+		fmt.Printf("  PID:  %d\n", state.PID)
+		fmt.Printf("  Port: %d\n", state.Port)
+		fmt.Printf("  Data: %s\n", state.DataDir)
+		fmt.Printf("  Logs: %s\n", doltserver.LogPath(serverDir))
+	},
+}
+
+var doltIdleMonitorCmd = &cobra.Command{
+	Use:    "idle-monitor",
+	Short:  "Run idle monitor (internal, not for direct use)",
+	Hidden: true,
+	Run: func(cmd *cobra.Command, args []string) {
+		beadsDir, _ := cmd.Flags().GetString("beads-dir")
+		if beadsDir == "" {
+			beadsDir = beads.FindBeadsDir()
+		}
+		if beadsDir == "" {
+			os.Exit(1)
+		}
+
+		// Write our PID
+		_ = os.WriteFile(filepath.Join(beadsDir, "dolt-monitor.pid"),
+			[]byte(strconv.Itoa(os.Getpid())), 0600)
+
+		// Parse idle timeout from config
+		idleTimeout := doltserver.DefaultIdleTimeout
+		if v := config.GetYamlConfig("dolt.idle-timeout"); v != "" {
+			if v == "0" {
+				// Disabled
+				return
+			}
+			if d, err := time.ParseDuration(v); err == nil {
+				idleTimeout = d
+			}
+		}
+
+		// Handle SIGTERM gracefully
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		go func() {
+			<-sigCh
+			_ = os.Remove(filepath.Join(beadsDir, "dolt-monitor.pid"))
+			os.Exit(0)
+		}()
+
+		doltserver.RunIdleMonitor(beadsDir, idleTimeout)
+	},
+}
+
+var doltKillallCmd = &cobra.Command{
+	Use:   "killall",
+	Short: "Kill all orphan Dolt server processes",
+	Long: `Find and kill orphan dolt sql-server processes not tracked by the
+canonical PID file.
+
+Under Gas Town, the canonical server lives at $GT_ROOT/.beads/. Any other
+dolt sql-server processes are considered orphans and will be killed.
+
+In standalone mode, all dolt sql-server processes are killed except the
+one tracked by the current project's PID file.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			beadsDir = "." // best effort
+		}
+
+		killed, err := doltserver.KillStaleServers(beadsDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			if doltserver.IsDaemonManaged() {
+				fmt.Fprintf(os.Stderr, "\nUnder Gas Town, use 'gt dolt' commands to manage the server.\n")
+			}
+			os.Exit(1)
+		}
+
+		if len(killed) == 0 {
+			fmt.Println("No orphan dolt servers found.")
+		} else {
+			fmt.Printf("Killed %d orphan dolt server(s): %v\n", len(killed), killed)
+		}
+	},
+}
+
+// staleDatabasePrefixes identifies test/polecat databases that should not persist
+// on the production Dolt server. These accumulate from interrupted test runs and
+// terminated polecats, wasting server memory.
+// - testdb_*: BEADS_TEST_MODE=1 FNV hash of temp paths
+// - doctest_*: doctor test helpers
+// - doctortest_*: doctor test helpers
+// - beads_pt*: gastown patrol_helpers_test.go random prefixes
+// - beads_vr*: gastown mail/router_test.go random prefixes
+var staleDatabasePrefixes = []string{"testdb_", "doctest_", "doctortest_", "beads_pt", "beads_vr"}
+
+var doltCleanDatabasesCmd = &cobra.Command{
+	Use:   "clean-databases",
+	Short: "Drop stale test/polecat databases from the Dolt server",
+	Long: `Identify and drop leftover test and polecat databases that accumulate
+on the shared Dolt server from interrupted test runs and terminated polecats.
+
+Stale database prefixes: testdb_*, doctest_*, doctortest_*, beads_pt*, beads_vr*
+
+These waste server memory and can degrade performance under concurrent load.
+Use --dry-run to see what would be dropped without actually dropping.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+
+		// Connect directly to the Dolt server via config instead of getStore(),
+		// which isn't initialized for dolt subcommands (beads-9vt).
+		db, cleanup := openDoltServerConnection()
+		defer cleanup()
+
+		listCtx, listCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer listCancel()
+
+		rows, err := db.QueryContext(listCtx, "SHOW DATABASES")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing databases: %v\n", err)
+			os.Exit(1)
+		}
+		defer rows.Close()
+
+		var stale []string
+		for rows.Next() {
+			var dbName string
+			if err := rows.Scan(&dbName); err != nil {
+				continue
+			}
+			for _, prefix := range staleDatabasePrefixes {
+				if strings.HasPrefix(dbName, prefix) {
+					stale = append(stale, dbName)
+					break
+				}
+			}
+		}
+
+		if len(stale) == 0 {
+			fmt.Println("No stale databases found.")
+			return
+		}
+
+		fmt.Printf("Found %d stale databases:\n", len(stale))
+		for _, name := range stale {
+			fmt.Printf("  %s\n", name)
+		}
+
+		if dryRun {
+			fmt.Println("\n(dry run — no databases dropped)")
+			return
+		}
+
+		fmt.Println()
+		dropped := 0
+		failures := 0
+		consecutiveTimeouts := 0
+		const (
+			batchSize           = 5  // Drop this many before pausing
+			batchPause          = 2 * time.Second
+			backoffPause        = 10 * time.Second
+			timeoutThreshold    = 3  // Consecutive timeouts before backoff
+			perDropTimeout      = 30 * time.Second
+			maxConsecFailures   = 10 // Stop after this many consecutive failures
+		)
+
+		for i, name := range stale {
+			// Circuit breaker: back off when server is overwhelmed
+			if consecutiveTimeouts >= timeoutThreshold {
+				fmt.Fprintf(os.Stderr, "  ⚠ %d consecutive timeouts — backing off %s\n",
+					consecutiveTimeouts, backoffPause)
+				time.Sleep(backoffPause)
+				consecutiveTimeouts = 0
+			}
+
+			// Stop if too many consecutive failures — server is likely unhealthy
+			if failures >= maxConsecFailures {
+				fmt.Fprintf(os.Stderr, "\n✗ Aborting: %d consecutive failures suggest server is unhealthy.\n", failures)
+				fmt.Fprintf(os.Stderr, "  Dropped %d/%d before stopping.\n", dropped, len(stale))
+				os.Exit(1)
+			}
+
+			// Per-operation timeout: DROP DATABASE can be slow on Dolt
+			dropCtx, dropCancel := context.WithTimeout(context.Background(), perDropTimeout)
+			// name is from SHOW DATABASES — safe to use in backtick-quoted identifier
+			_, err := db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE `%s`", name)) //nolint:gosec // G201: name from SHOW DATABASES
+			dropCancel()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  FAIL: %s: %v\n", name, err)
+				failures++
+				if isTimeoutError(err) {
+					consecutiveTimeouts++
+				}
+			} else {
+				fmt.Printf("  Dropped: %s\n", name)
+				dropped++
+				failures = 0
+				consecutiveTimeouts = 0
+			}
+
+			// Rate limiting: pause between batches to let the server breathe
+			if (i+1)%batchSize == 0 && i+1 < len(stale) {
+				fmt.Printf("  [%d/%d] pausing %s...\n", i+1, len(stale), batchPause)
+				time.Sleep(batchPause)
+			}
+		}
+		fmt.Printf("\nDropped %d/%d stale databases.\n", dropped, len(stale))
+	},
+}
+
+// isTimeoutError checks if an error is a context deadline exceeded or timeout.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == context.DeadlineExceeded {
+		return true
+	}
+	// Check for net.Error timeout (covers TCP and MySQL driver timeouts)
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Also catch wrapped context.DeadlineExceeded
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func init() {
 	doltSetCmd.Flags().Bool("update-config", false, "Also write to config.yaml for team-wide defaults")
+	doltStopCmd.Flags().Bool("force", false, "Force stop even when managed by Gas Town daemon")
 	doltPushCmd.Flags().Bool("force", false, "Force push (overwrite remote changes)")
 	doltCommitCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
+	doltIdleMonitorCmd.Flags().String("beads-dir", "", "Path to .beads directory")
+	doltCleanDatabasesCmd.Flags().Bool("dry-run", false, "Show what would be dropped without dropping")
 	doltCmd.AddCommand(doltShowCmd)
 	doltCmd.AddCommand(doltSetCmd)
 	doltCmd.AddCommand(doltTestCmd)
-	doltCmd.AddCommand(doltStartCmd)
-	doltCmd.AddCommand(doltStopCmd)
 	doltCmd.AddCommand(doltCommitCmd)
 	doltCmd.AddCommand(doltPushCmd)
 	doltCmd.AddCommand(doltPullCmd)
+	doltCmd.AddCommand(doltStartCmd)
+	doltCmd.AddCommand(doltStopCmd)
+	doltCmd.AddCommand(doltStatusCmd)
+	doltCmd.AddCommand(doltIdleMonitorCmd)
+	doltCmd.AddCommand(doltKillallCmd)
+	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	rootCmd.AddCommand(doltCmd)
 }
 
@@ -270,12 +596,11 @@ func showDoltConfig(testConnection bool) {
 			"backend": backend,
 		}
 		if backend == configfile.BackendDolt {
-			result["mode"] = cfg.GetDoltMode()
 			result["database"] = cfg.GetDoltDatabase()
 			result["host"] = cfg.GetDoltServerHost()
 			result["port"] = cfg.GetDoltServerPort()
 			result["user"] = cfg.GetDoltServerUser()
-			if cfg.IsDoltServerMode() && testConnection {
+			if testConnection {
 				result["connection_ok"] = testServerConnection(cfg)
 			}
 		}
@@ -290,21 +615,17 @@ func showDoltConfig(testConnection bool) {
 
 	fmt.Println("Dolt Configuration")
 	fmt.Println("==================")
-	fmt.Printf("  Mode:     %s\n", cfg.GetDoltMode())
 	fmt.Printf("  Database: %s\n", cfg.GetDoltDatabase())
+	fmt.Printf("  Host:     %s\n", cfg.GetDoltServerHost())
+	fmt.Printf("  Port:     %d\n", cfg.GetDoltServerPort())
+	fmt.Printf("  User:     %s\n", cfg.GetDoltServerUser())
 
-	if cfg.IsDoltServerMode() {
-		fmt.Printf("  Host:     %s\n", cfg.GetDoltServerHost())
-		fmt.Printf("  Port:     %d\n", cfg.GetDoltServerPort())
-		fmt.Printf("  User:     %s\n", cfg.GetDoltServerUser())
-
-		if testConnection {
-			fmt.Println()
-			if testServerConnection(cfg) {
-				fmt.Printf("  %s\n", ui.RenderPass("✓ Server connection OK"))
-			} else {
-				fmt.Printf("  %s\n", ui.RenderWarn("✗ Server not reachable"))
-			}
+	if testConnection {
+		fmt.Println()
+		if testServerConnection(cfg) {
+			fmt.Printf("  %s\n", ui.RenderPass("✓ Server connection OK"))
+		} else {
+			fmt.Printf("  %s\n", ui.RenderWarn("✗ Server not reachable"))
 		}
 	}
 
@@ -340,13 +661,8 @@ func setDoltConfig(key, value string, updateConfig bool) {
 
 	switch key {
 	case "mode":
-		if value != configfile.DoltModeEmbedded && value != configfile.DoltModeServer {
-			fmt.Fprintf(os.Stderr, "Error: mode must be '%s' or '%s'\n",
-				configfile.DoltModeEmbedded, configfile.DoltModeServer)
-			os.Exit(1)
-		}
-		cfg.DoltMode = value
-		yamlKey = "dolt.mode"
+		fmt.Fprintf(os.Stderr, "Error: mode is no longer configurable; beads always uses server mode\n")
+		os.Exit(1)
 
 	case "database":
 		if value == "" {
@@ -463,12 +779,9 @@ func testDoltConnection() {
 
 	if testServerConnection(cfg) {
 		fmt.Printf("%s\n", ui.RenderPass("✓ Connection successful"))
-		fmt.Println("\nYou can now use server mode:")
-		fmt.Println("  bd dolt set mode server")
 	} else {
 		fmt.Printf("%s\n", ui.RenderWarn("✗ Connection failed"))
-		fmt.Println("\nMake sure dolt sql-server is running:")
-		fmt.Printf("  cd /path/to/dolt/db && dolt sql-server --port=%d\n", port)
+		fmt.Println("\nStart the server with: bd dolt start")
 		os.Exit(1)
 	}
 }
@@ -486,10 +799,14 @@ func testServerConnection(cfg *configfile.Config) bool {
 	return true
 }
 
-func startDoltServer() {
+// openDoltServerConnection opens a direct MySQL connection to the Dolt server
+// using config from the beads directory. This bypasses getStore() which isn't
+// initialized for dolt subcommands (beads-9vt). Connects without selecting a
+// database so callers can operate on all databases (SHOW DATABASES, DROP DATABASE).
+func openDoltServerConnection() (*sql.DB, func()) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
+		fmt.Fprintln(os.Stderr, "Error: not in a beads repository (no .beads directory found)")
 		os.Exit(1)
 	}
 
@@ -502,173 +819,44 @@ func startDoltServer() {
 		cfg = configfile.DefaultConfig()
 	}
 
-	dataDir := filepath.Join(beadsDir, "dolt")
-	logFile := filepath.Join(beadsDir, "dolt-server.log")
 	host := cfg.GetDoltServerHost()
 	port := cfg.GetDoltServerPort()
 	user := cfg.GetDoltServerUser()
-	database := cfg.GetDoltDatabase()
+	password := os.Getenv("BEADS_DOLT_PASSWORD")
 
-	// Check if server is already running
-	if pid := dolt.GetRunningServerPID(dataDir); pid > 0 {
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"error":   "server_already_running",
-				"message": fmt.Sprintf("Dolt server already running (PID %d)", pid),
-				"pid":     pid,
-				"host":    host,
-				"port":    port,
-			})
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: Dolt server already running (PID %d)\n", pid)
-			fmt.Fprintf(os.Stderr, "Stop it first: bd dolt stop\n")
-		}
+	var connStr string
+	if password != "" {
+		connStr = fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
+			user, password, host, port)
+	} else {
+		connStr = fmt.Sprintf("%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
+			user, host, port)
+	}
+
+	db, err := sql.Open("mysql", connStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to Dolt server: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Check if data directory exists
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"error":   "data_dir_not_found",
-				"message": fmt.Sprintf("Dolt data directory not found: %s", dataDir),
-			})
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: Dolt data directory not found: %s\n", dataDir)
-			fmt.Fprintf(os.Stderr, "Run 'bd init' first to create the database.\n")
-		}
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Second)
+
+	// Verify connectivity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		fmt.Fprintf(os.Stderr, "Error: cannot reach Dolt server at %s:%d: %v\n", host, port, err)
+		fmt.Fprintln(os.Stderr, "Start the server with: bd dolt start")
 		os.Exit(1)
 	}
 
-	if !jsonOutput {
-		fmt.Println("Starting Dolt SQL server...")
-		fmt.Printf("  Host:     %s\n", host)
-		fmt.Printf("  Port:     %d\n", port)
-		fmt.Printf("  User:     %s\n", user)
-		fmt.Printf("  Database: %s\n", database)
-		fmt.Printf("  Data dir: %s\n", dataDir)
-		fmt.Printf("  Log file: %s\n", logFile)
-		fmt.Println()
-		fmt.Print("Waiting for server to accept connections...")
-	}
-
-	server := dolt.NewServer(dolt.ServerConfig{
-		DataDir:           dataDir,
-		SQLPort:           port,
-		Host:              host,
-		LogFile:           logFile,
-		User:              user,
-		DisableRemotesAPI: true, // remotesapi only needed for federation
-	})
-
-	if err := server.Start(context.Background()); err != nil {
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"error":   "start_failed",
-				"message": err.Error(),
-			})
-		} else {
-			fmt.Println() // finish the "Waiting..." line
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Check the log file for details: %s\n", logFile)
-		}
-		os.Exit(1)
-	}
-	if !jsonOutput {
-		fmt.Println() // finish the "Waiting..." line
-	}
-
-	pid := dolt.GetRunningServerPID(dataDir)
-
-	if jsonOutput {
-		outputJSON(map[string]interface{}{
-			"status":   "started",
-			"pid":      pid,
-			"host":     host,
-			"port":     port,
-			"user":     user,
-			"database": database,
-			"data_dir": dataDir,
-			"log_file": logFile,
-		})
-		return
-	}
-
-	fmt.Printf("  %s\n", ui.RenderPass(fmt.Sprintf("✓ Server started (PID %d)", pid)))
-	fmt.Println()
-	if !cfg.IsDoltServerMode() {
-		fmt.Println("To use server mode:")
-		fmt.Println("  bd dolt set mode server")
-		fmt.Println()
-	}
-	fmt.Println("To stop the server:")
-	fmt.Println("  bd dolt stop")
+	return db, func() { _ = db.Close() }
 }
 
-func stopDoltServer() {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
-		os.Exit(1)
-	}
-
-	cfg, _ := configfile.Load(beadsDir)
-
-	dataDir := filepath.Join(beadsDir, "dolt")
-
-	pid := dolt.GetRunningServerPID(dataDir)
-	if pid == 0 {
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"status":  "not_running",
-				"message": "No Dolt server is running",
-			})
-		} else {
-			fmt.Println("No Dolt server is running.")
-		}
-		return
-	}
-
-	if !jsonOutput {
-		fmt.Printf("Stopping Dolt SQL server (PID %d)...\n", pid)
-	}
-
-	if err := dolt.StopServerByPID(pid); err != nil {
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"error":   "stop_failed",
-				"message": err.Error(),
-				"pid":     pid,
-			})
-		} else {
-			fmt.Fprintf(os.Stderr, "Error stopping server: %v\n", err)
-		}
-		os.Exit(1)
-	}
-
-	// Clean up PID file
-	pidFile := filepath.Join(dataDir, "dolt-server.pid")
-	_ = os.Remove(pidFile)
-
-	if jsonOutput {
-		outputJSON(map[string]interface{}{
-			"status": "stopped",
-			"pid":    pid,
-		})
-		return
-	}
-
-	fmt.Printf("%s\n", ui.RenderPass("✓ Server stopped"))
-
-	// Warn if still in server mode
-	if cfg != nil && cfg.IsDoltServerMode() {
-		fmt.Println()
-		fmt.Println("Note: You are still in server mode. bd commands will fail")
-		fmt.Println("until the server is restarted or you switch to embedded mode:")
-		fmt.Println("  bd dolt set mode embedded")
-	}
-}
-
+// doltServerPidFile returns the path to the PID file for the managed dolt server.
 // logDoltConfigChange appends an audit entry to .beads/dolt-config.log.
 // Includes the beadsDir path for debugging worktree config pollution (bd-la2cl).
 func logDoltConfigChange(beadsDir, key, value string) {
